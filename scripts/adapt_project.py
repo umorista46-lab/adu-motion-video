@@ -292,6 +292,49 @@ def check_aspect(meta: dict, slot: dict, label: str) -> None:
             f"{label} aspect {width}:{height} differs from required {aspect} beyond {tolerance:.0%}")
 
 
+def _distinct_definitions(values: list) -> list:
+    found = []
+    for value in values:
+        if all(value != seen for seen in found):
+            found.append(value)
+    return found
+
+
+def resolve_asset_definition(definitions: dict | None, scene_id: str | None, slot_id: str):
+    """Bind one pack contract, or fail when the bare name is ambiguous.
+
+    A library manifest qualifies differing contracts as ``style:name`` and
+    publishes the bare name only when every copy matches. A namespaced scene
+    uses its own style. An unscoped scene may use the bare name, never one
+    arbitrary side of a disagreement.
+    """
+    if not definitions:
+        return {}
+    require(isinstance(definitions, dict), "assetDefinitions must be an object")
+    scoped = []
+    for key, value in definitions.items():
+        if isinstance(key, str) and ":" in key:
+            owner, name = key.split(":", 1)
+            if owner and name == slot_id:
+                scoped.append((owner, value))
+    bare_present = slot_id in definitions
+    bare = definitions.get(slot_id)
+    owner = scene_id.split(":", 1)[0] if isinstance(scene_id, str) and ":" in scene_id else None
+    if owner:
+        distinct = _distinct_definitions([value for item_owner, value in scoped if item_owner == owner])
+        require(len(distinct) <= 1, f"Conflicting library asset definitions: {owner}:{slot_id}")
+        if distinct:
+            require(not bare_present or bare == distinct[0], f"Ambiguous library asset definition: {slot_id}")
+            return distinct[0]
+        if bare_present:
+            require(all(value == bare for _, value in scoped), f"Ambiguous library asset definition: {slot_id}")
+            return bare
+        return {}
+    distinct = _distinct_definitions(([bare] if bare_present else []) + [value for _, value in scoped])
+    require(len(distinct) <= 1, f"Ambiguous library asset definition: {slot_id}")
+    return distinct[0] if distinct else {}
+
+
 def slot_bindings(scene: dict, target: dict, spec_dir: Path, project: Path | None,
                   asset_definitions: dict | None = None) -> tuple[dict, list[dict]]:
     asset_definitions = asset_definitions or {}
@@ -352,7 +395,7 @@ def slot_bindings(scene: dict, target: dict, spec_dir: Path, project: Path | Non
             if kind in {"sequence", "wall-sprites"}:
                 non_jpeg = [file.name for file in files if file.suffix.lower() != ".jpg"]
                 require(not non_jpeg, f"{label} needs prepared JPEG frames; found {non_jpeg[:3]}")
-            definition = asset_definitions.get(slot_id, {})
+            definition = resolve_asset_definition(asset_definitions, scene.get("id"), slot_id)
             authored_count = definition.get("originalFrames") if kind == "sequence" else None
             full_wall_count = (definition.get("originalSprites", definition.get("originalItems"))
                                if kind == "wall-sprites" else None)

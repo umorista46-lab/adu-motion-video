@@ -108,20 +108,52 @@ def requirements(entry, brief):
     return missing
 
 
+def merge_library_assets(manifest, entries):
+    """Keep a style's own asset contract when the same name differs across packs.
+
+    Library scenes are already qualified by style. Asset names are not a single
+    global object: portrait and landscape both have 01-D and 03-A `wall`
+    contracts with different fields. Requiring those objects to be equal aborts
+    planning before any scene is chosen. A bare name is published only when
+    every participating definition is identical, so an unscoped pack lookup
+    cannot choose one side. A second, different value for the same style is
+    still a conflict.
+    """
+    seen = {}
+    for entry in entries:
+        style = entry['styleId']
+        require(isinstance(style, str) and bool(style.strip()) and ':' not in style,
+                'Library style id must be a bare name')
+        definitions = entry['manifest'].get('assetDefinitions', {})
+        require(isinstance(definitions, dict), style + ' assetDefinitions must be an object')
+        for key, value in definitions.items():
+            require(isinstance(key, str) and bool(key.strip()), style + ' assetDefinitions need string names')
+            qualified = style + ':' + key
+            previous = manifest['assetDefinitions'].get(qualified)
+            require(previous is None or previous == value,
+                    'Conflicting library asset definitions: ' + qualified)
+            manifest['assetDefinitions'][qualified] = deepcopy(value)
+            seen.setdefault(key, []).append(value)
+    for key, values in seen.items():
+        if any(value != values[0] for value in values):
+            continue
+        previous = manifest['assetDefinitions'].get(key)
+        require(previous is None or previous == values[0],
+                'Conflicting library asset definitions: ' + key)
+        manifest['assetDefinitions'][key] = deepcopy(values[0])
+
+
 def universe(entries, brief):
     manifest = dict(id='auto-template-library', version='1', fps=60, requireMotionWindows=True,
                     layouts={'landscape': dict(width=1920, height=1080),
                              'portrait': dict(width=1080, height=1920)}, scenes=[], assetDefinitions={})
     contracts = []
     index = {}
+    merge_library_assets(manifest, entries)
     for entry in entries:
         m = entry['manifest']
         require(m['fps'] == 60, 'Auto library currently requires the shared 60fps source clock')
         names = {s['id']: entry['styleId'] + ':' + s['id'] for s in m['scenes']}
-        for key, value in m.get('assetDefinitions', {}).items():
-            require(key not in manifest['assetDefinitions'] or manifest['assetDefinitions'][key] == value,
-                    'Conflicting library asset definitions: ' + key)
-            manifest['assetDefinitions'][key] = deepcopy(value)
         for source in m['scenes']:
             sid = names[source['id']]
             clone = deepcopy(source); clone['id'] = sid
