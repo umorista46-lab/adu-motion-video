@@ -380,7 +380,7 @@ def preflight_narration(pack: dict, spec: dict, talk: Path) -> dict:
     return {'fps': fps, 'expectedFrames': end, **timing, 'stage': 'metadata-before-frame-extraction'}
 
 
-def build(pack_dir: Path, spec_path: Path, talk: Path, output: Path, subs_js: Path | None, *, _narration_slice: tuple | None = None, _composition_context=None, edit_map=None) -> None:
+def build(pack_dir: Path, spec_path: Path, talk: Path, output: Path, subs_js: Path | None, *, _narration_slice: tuple | None = None, _composition_context=None, edit_map=None, presenter_binding=None) -> None:
     if output.exists() or output.is_symlink(): fail(f'Refusing existing project: {output}')
     if not output.parent.is_dir(): fail(f'Project parent does not exist: {output.parent}')
     pack = read_json(pack_dir / 'manifest.json'); spec = read_json(spec_path)
@@ -403,6 +403,10 @@ def build(pack_dir: Path, spec_path: Path, talk: Path, output: Path, subs_js: Pa
     repair_mode=spec.get('repairPolicy',{}).get('mode','off')
     if repair_mode not in {'off','basic'}:fail('repairPolicy.mode must be off or basic')
     if repair_mode=='off': edit_map=None # no inherited map opens or repair scans
+    if presenter_binding is not None and (edit_map is not None or repair_mode != 'off'):
+        fail('Presenter binding keeps the original narration clock and cannot be combined with repair or --edit-map')
+    if presenter_binding is not None and spec.get('colorReviewFile'):
+        fail('Presenter binding does not use the single-talk color review')
     if edit_map is not None and _narration_slice is None:
         from repair_talk import validate_master
         mapped,edited_master=validate_master(edit_map,talk)
@@ -410,6 +414,17 @@ def build(pack_dir: Path, spec_path: Path, talk: Path, output: Path, subs_js: Pa
         if spec.get('narrationClock')!='edited-narration':fail('Replan in edited-narration before building a repaired master')
         from narration_slice import preflight
         narration_preflight=preflight(edited_master,talk,0,mapped['editedFrames'],spec.get('fps',pack['fps']))
+    elif presenter_binding is not None and _narration_slice is None:
+        from adapt_project import integer, target_span
+        fps = integer(spec.get('fps', pack['fps']), 'spec.fps', minimum=1)
+        if fps != 60: fail('Presenter binding uses the 60fps narration grid')
+        end = 0
+        for index, scene in enumerate(spec['scenes']):
+            _, end = target_span(scene, end, fps, index)
+        from presenter_binding import validate
+        validate(presenter_binding, talk, end)
+        narration_preflight = dict(fps=fps, expectedFrames=end, frames=end, duration=end / fps,
+                                   stage='presenter-binding-narration-master')
     elif _narration_slice is None:
         if repair_mode=='basic':fail('Basic repair needs an explicitly prepared --edit-map; run repair-plan/apply and replan first')
         narration_preflight = preflight_narration(pack, spec, talk)
@@ -444,6 +459,9 @@ def build(pack_dir: Path, spec_path: Path, talk: Path, output: Path, subs_js: Pa
             if subs_js is None and (stage/'edited.srt').is_file():
                 from build_subs import build as subtitle_data
                 (stage/'subs.js').write_text('const SUBS='+json.dumps(subtitle_data(stage/'edited.srt'),ensure_ascii=False)+';\n')
+        elif presenter_binding is not None and _narration_slice is None:
+            from presenter_binding import install as install_binding
+            install_binding(presenter_binding, talk, stage, narration_preflight['frames'])
         elif _narration_slice is None:
             subprocess.run(import_command, check=True)
         else:

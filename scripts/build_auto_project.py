@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build a catalog-selected composition with one unchanged narration master."""
+"""Build a catalog-selected composition with one unchanged narration master.
+
+TALK is that master. Without --presenter-binding it is the existing single
+audio+video talk. With a binding it is 48 kHz stereo PCM, and presenter
+pictures come only from the binding's source windows.
+"""
 from __future__ import annotations
 import argparse
 from copy import deepcopy
@@ -48,7 +53,7 @@ def global_scene(item, offset, fps):
     return value
 
 
-def build_auto(plan_path, talk, output, subs_js=None, *, edit_map=None):
+def build_auto(plan_path, talk, output, subs_js=None, *, edit_map=None, presenter_binding=None):
     require(not output.exists() and not output.is_symlink(), 'Refusing existing auto project')
     require(output.parent.is_dir(), 'Auto project parent must exist')
     saved = read_json(plan_path)
@@ -72,7 +77,14 @@ def build_auto(plan_path, talk, output, subs_js=None, *, edit_map=None):
     repair_mode=result['spec'].get('repairPolicy',{}).get('mode','off')
     if repair_mode=='off':edit_map=None
     if repair_mode not in {'off','basic'}:raise ValueError('Invalid repairPolicy.mode')
-    if repair_mode=='basic':
+    if presenter_binding is not None:
+        if edit_map is not None or repair_mode != 'off':
+            raise ValueError('Presenter binding keeps the original narration clock and cannot be combined with repair or --edit-map')
+        if result['spec'].get('colorReviewFile'):
+            raise ValueError('Presenter binding does not use the single-talk color review')
+        from presenter_binding import validate
+        validate(presenter_binding, talk, result['report']['durationFrames'])
+    elif repair_mode=='basic':
         require(edit_map is not None,'Basic mode requires a prepared --edit-map for this invocation')
         require(result['spec'].get('narrationClock')=='edited-narration','Replan in edited-narration after repair')
         from repair_talk import validate_master
@@ -92,7 +104,7 @@ def build_auto(plan_path, talk, output, subs_js=None, *, edit_map=None):
     if len(runs) == 1:
         with tempfile.TemporaryDirectory(prefix='adu-auto-spec-') as tmp:
             path=Path(tmp)/'spec.json';write(path,runs[0]['spec'])
-            build(resolve(runs[0]['selection'],ROOT/'packs'),path,talk,output,subs_js,edit_map=edit_map)
+            build(resolve(runs[0]['selection'],ROOT/'packs'),path,talk,output,subs_js,edit_map=edit_map,presenter_binding=presenter_binding)
         write(output/'auto_selection.json',result['report'])
         return
     with tempfile.TemporaryDirectory(prefix='.adu-auto-build-', dir=output.parent) as tmp:
@@ -101,7 +113,10 @@ def build_auto(plan_path, talk, output, subs_js=None, *, edit_map=None):
         # PCM audio slices derive from this exact output grid, never re-encode.
         command=[sys.executable,str(ROOT/'scripts/import_talk.py'),str(stage),str(talk),'--fps','60']
         if result['spec'].get('colorReviewFile'): command.extend(['--color-review',result['spec']['colorReviewFile']])
-        if edit_map is not None:
+        if presenter_binding is not None:
+            from presenter_binding import install
+            install(presenter_binding, talk, stage, result['report']['durationFrames'])
+        elif edit_map is not None:
             from repair_talk import install_master
             install_master(edit_map,talk,stage)
             if subs_js is None and (stage/'edited.srt').is_file():
@@ -205,10 +220,15 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('plan',type=Path);p.add_argument('talk',type=Path);p.add_argument('output',type=Path)
     p.add_argument('--subs-js',type=Path);p.add_argument('--edit-map',type=Path)
+    p.add_argument('--presenter-binding',type=Path,
+                   help='Map sparse presenter sources onto TALK, a 48 kHz stereo PCM narration master')
     a=p.parse_args()
     try:
+        if a.presenter_binding and a.edit_map:
+            raise ValueError('Presenter binding and --edit-map cannot be combined')
         build_auto(a.plan.expanduser().resolve(),a.talk.expanduser().resolve(),a.output.expanduser().absolute(),
-                   a.subs_js.expanduser().resolve() if a.subs_js else None,edit_map=a.edit_map)
+                   a.subs_js.expanduser().resolve() if a.subs_js else None,edit_map=a.edit_map,
+                   presenter_binding=a.presenter_binding.expanduser().resolve() if a.presenter_binding else None)
         print(json.dumps(dict(output=str(a.output),status='built-not-visually-accepted'),ensure_ascii=False))
     except (AdaptError,ValueError,OSError,subprocess.CalledProcessError) as exc:p.exit(1,f'Auto build failed: {exc}\n')
 

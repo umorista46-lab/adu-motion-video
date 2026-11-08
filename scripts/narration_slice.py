@@ -13,9 +13,15 @@ def preflight(master: Path, talk: Path, start: int, end: int, fps: int):
     require(report['fps'] == fps, 'Master import FPS differs from child clock')
     integer(start, 'slice.start'); integer(end, 'slice.end', minimum=1)
     require(start < end <= report['frames'], 'Narration slice lies outside the master frame clock')
-    color = report['color']
-    require(fingerprint_file(talk) == dict(sha256=color['source_sha256'], sizeBytes=color['source_size_bytes']),
-            'Narration source changed after the master import')
+    binding = report.get('presenterBinding')
+    if binding:
+        narration = binding.get('narration') or {}
+        require(fingerprint_file(talk) == dict(sha256=narration.get('sha256'), sizeBytes=narration.get('sizeBytes')),
+                'Narration master changed after presenter binding')
+    else:
+        color = report['color']
+        require(fingerprint_file(talk) == dict(sha256=color['source_sha256'], sizeBytes=color['source_size_bytes']),
+                'Narration source changed after the master import')
     return dict(fps=fps, expectedFrames=end-start, frames=end-start, duration=(end-start)/fps,
                 masterStartFrame=start, masterEndFrame=end, masterFrames=report['frames'],
                 stage='slice-of-verified-master-import')
