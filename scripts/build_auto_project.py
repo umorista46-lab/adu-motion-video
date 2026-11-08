@@ -2,8 +2,9 @@
 """Build a catalog-selected composition with one unchanged narration master.
 
 TALK is that master. Without --presenter-binding it is the existing single
-audio+video talk. With a binding it is 48 kHz stereo PCM, and presenter
-pictures come only from the binding's source windows.
+audio+video talk. With a binding it is 24 kHz or 48 kHz 16-bit PCM, mono or
+stereo, copied without resampling. Presenter pictures come only from the
+binding's source windows.
 """
 from __future__ import annotations
 import argparse
@@ -221,7 +222,7 @@ def main():
     p.add_argument('plan',type=Path);p.add_argument('talk',type=Path);p.add_argument('output',type=Path)
     p.add_argument('--subs-js',type=Path);p.add_argument('--edit-map',type=Path)
     p.add_argument('--presenter-binding',type=Path,
-                   help='Map sparse presenter sources onto TALK, a 48 kHz stereo PCM narration master')
+                   help='Map sparse presenter sources onto TALK, a 24 kHz or 48 kHz 16-bit PCM narration master')
     a=p.parse_args()
     try:
         if a.presenter_binding and a.edit_map:

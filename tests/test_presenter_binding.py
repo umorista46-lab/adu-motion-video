@@ -24,25 +24,25 @@ from adapt_project import AdaptError
 from auto_templates import library, save
 from build_auto_project import build_auto
 from color_management import fingerprint_file
+from narration_slice import install as slice_voice
 from narration_slice import preflight
 from presenter_binding import ABSENCE_RGB, GEOMETRY, install
 
 
-def tone(samples):
+def tone(samples, channels=2):
     data = array('h')
     for index in range(samples):
-        value = int(9000 * math.sin(index / 47))
-        data.append(value)
-        data.append(value)
+        value = (index % 997) + 1
+        data.extend([value] * channels)
     return data.tobytes()
 
 
-def write_wav(path, samples):
+def write_wav(path, samples, rate=48000, channels=2):
     with wave.open(str(path), 'wb') as handle:
-        handle.setnchannels(2)
+        handle.setnchannels(channels)
         handle.setsampwidth(2)
-        handle.setframerate(48000)
-        handle.writeframes(tone(samples))
+        handle.setframerate(rate)
+        handle.writeframes(tone(samples, channels))
 
 
 def write_source(path, frames, rate=60):
@@ -130,11 +130,9 @@ class PresenterBindingTests(unittest.TestCase):
             write_wav(narration, 240 * 800)
             source = root / 'person.mp4'
             write_source(source, 30)
-            def bind(windows, samples=240 * 800, rate=48000):
+            def bind(windows, samples=240 * 800, rate=48000, channels=2):
                 file = root / 'case.wav'
-                with wave.open(str(file), 'wb') as handle:
-                    handle.setnchannels(2); handle.setsampwidth(2); handle.setframerate(rate)
-                    handle.writeframes(tone(samples))
+                write_wav(file, samples, rate, channels)
                 payload = dict(schema='adu-presenter-binding/1', narration=dict(sha256=sha256(file)),
                                sources=[dict(id='person-a', path=str(source), sha256=sha256(source))], windows=windows)
                 path = root / 'case.json'
@@ -150,6 +148,45 @@ class PresenterBindingTests(unittest.TestCase):
             path, file = bind([dict(id='a', sourceId='person-a', masterStartFrame=0, masterEndFrame=120, sourceStartFrame=0)])
             with self.assertRaisesRegex(ValueError, 'extends past its presenter source'):
                 install(path, file, root / 'tail', 240)
+            path, file = bind([dict(id='a', sourceId='person-a', masterStartFrame=0, masterEndFrame=10, sourceStartFrame=0)],
+                              samples=240 * 800 + 10)
+            with self.assertRaisesRegex(ValueError, 'audible'):
+                install(path, file, root / 'audible-tail', 240)
+
+    def test_production_24k_mono_grid_pads_187_and_slice_keeps_it(self):
+        self.assertEqual(21195 * 400, 8478000)
+        self.assertEqual(8478000 - 8477813, 187)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            narration = root / 'master.wav'
+            write_wav(narration, 8477813, 24000, 1)
+            source = root / 'person.mp4'
+            write_source(source, 60)
+            binding = root / 'binding.json'
+            binding.write_text(json.dumps(dict(
+                schema='adu-presenter-binding/1', narration=dict(sha256=sha256(narration)),
+                sources=[dict(id='person-a', path='person.mp4', sha256=sha256(source))],
+                windows=[dict(id='w', sourceId='person-a', masterStartFrame=0, masterEndFrame=30, sourceStartFrame=0)])))
+            stage = root / 'stage'
+            stage.mkdir()
+            receipt = install(binding, narration, stage, 21195)
+            self.assertEqual(receipt['presenterBinding']['narration']['edgeQuantizationSamples'], 187)
+            self.assertEqual(receipt['presenterBinding']['narration']['sampleRate'], 24000)
+            self.assertEqual(receipt['presenterBinding']['narration']['channels'], 1)
+            with wave.open(str(stage / 'voice.wav'), 'rb') as handle:
+                self.assertEqual((handle.getframerate(), handle.getnchannels(), handle.getsampwidth()), (24000, 1, 2))
+                body = handle.readframes(handle.getnframes())
+            original = tone(8477813, 1)
+            self.assertEqual(body[:len(original)], original)
+            self.assertEqual(body[len(original):], b'\x00' * (187 * 2))
+            child = root / 'child'
+            (child / 'talk').mkdir(parents=True)
+            slice_voice(stage, child, 21185, 21195, 60)
+            with wave.open(str(child / 'voice.wav'), 'rb') as handle:
+                self.assertEqual((handle.getframerate(), handle.getnchannels()), (24000, 1))
+                sliced = handle.readframes(handle.getnframes())
+            self.assertEqual(sliced[:3813 * 2], original[8474000 * 2:])
+            self.assertEqual(sliced[3813 * 2:], b'\x00' * (187 * 2))
 
     def test_single_talk_import_still_rejects_wav_and_hashes_its_own_video(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -175,6 +212,19 @@ class PresenterBindingTests(unittest.TestCase):
             video.write_bytes(b'different-bytes')
             with self.assertRaisesRegex(AdaptError, 'Narration source changed'):
                 preflight(project, video, 0, 10, 60)
+            legacy = root / 'legacy'
+            (legacy / 'talk/clip_000').mkdir(parents=True)
+            for index in range(1, 11):
+                (legacy / 'talk/clip_000' / f'f_{index:05d}.jpg').write_bytes(b'x')
+            write_wav(legacy / 'voice.wav', 10 * 800, 48000, 2)
+            (legacy / 'import.json').write_text(json.dumps(dict(
+                fps=60, frames=10, color=dict(source_sha256=identity['sha256'], source_size_bytes=identity['sizeBytes']))))
+            child = root / 'legacy-child'
+            (child / 'talk').mkdir(parents=True)
+            slice_voice(legacy, child, 2, 6, 60)
+            with wave.open(str(child / 'voice.wav'), 'rb') as handle:
+                self.assertEqual((handle.getframerate(), handle.getnchannels(), handle.getsampwidth()), (48000, 2, 2))
+                self.assertEqual(handle.readframes(handle.getnframes()), tone(10 * 800, 2)[2 * 800 * 4:6 * 800 * 4])
             help_text = subprocess.run([sys.executable, str(ROOT / 'scripts/pipeline.py'), 'auto-build', '--help'],
                                        capture_output=True, text=True)
             self.assertEqual(help_text.returncode, 0)
@@ -228,7 +278,8 @@ class PresenterBindingTests(unittest.TestCase):
             brief_path.write_text(json.dumps(brief))
             save(brief_path, root / 'plan')
             narration = root / 'master.wav'
-            write_wav(narration, frames * 800 - 100)
+            native_samples = frames * 400 - 187
+            write_wav(narration, native_samples, 24000, 1)
             source = root / 'person.mp4'
             write_source(source, 180)
             binding = root / 'binding.json'
@@ -240,13 +291,19 @@ class PresenterBindingTests(unittest.TestCase):
             project = root / 'project'
             build_auto(root / 'plan/auto_plan.json', narration, project, presenter_binding=binding)
             with wave.open(str(project / 'voice.wav'), 'rb') as handle:
+                self.assertEqual((handle.getframerate(), handle.getnchannels(), handle.getsampwidth()), (24000, 1, 2))
                 body = handle.readframes(handle.getnframes())
-            original = tone(frames * 800 - 100)
-            self.assertTrue(body.startswith(original))
-            self.assertEqual(len(body), frames * 800 * 4)
-            self.assertEqual(body[len(original):], b'\x00' * (100 * 4))
+            original = tone(native_samples, 1)
+            self.assertEqual(body[:len(original)], original)
+            self.assertEqual(body[len(original):], b'\x00' * (187 * 2))
+            self.assertEqual(len(body), frames * 400 * 2)
             imported = json.loads((project / 'import.json').read_text())
-            self.assertEqual(imported['presenterBinding']['narration']['edgeQuantizationSamples'], 100)
+            narration_receipt = imported['presenterBinding']['narration']
+            self.assertEqual(narration_receipt['edgeQuantizationSamples'], 187)
+            self.assertEqual(narration_receipt['sampleRate'], 24000)
+            self.assertEqual(narration_receipt['channels'], 1)
+            self.assertEqual(narration_receipt['trimmedTailSamples'], 0)
+            self.assertIn('not this PCM master', narration_receipt['stages']['delivery'])
             gap = pixel(project / 'talk/clip_000/f_00001.jpg')
             self.assertLess(sum(abs(a - b) for a, b in zip(gap, ABSENCE_RGB)), 12)
             produced = project / 'talk/clip_000/f_00049.jpg'
@@ -258,8 +315,11 @@ class PresenterBindingTests(unittest.TestCase):
             joined = b''
             for part in parts:
                 with wave.open(str(part / 'voice.wav'), 'rb') as handle:
+                    self.assertEqual((handle.getframerate(), handle.getnchannels(), handle.getsampwidth()), (24000, 1, 2))
                     joined += handle.readframes(handle.getnframes())
             self.assertEqual(joined, body)
+            self.assertEqual(joined[:len(original)], original)
+            self.assertEqual(joined[len(original):], b'\x00' * (187 * 2))
             self.assertEqual([part['style'] for part in json.loads((project / 'macro_plan.json').read_text())['parts']], ['01-D', '01-E'])
             stills = root / 'stills'
             command = ['node', str(ROOT / 'scripts/render_project.mjs'), str(parts[0] / 'index.html'),

@@ -38,12 +38,17 @@ def install(master: Path, stage: Path, start: int, end: int, fps: int):
         try: os.link(src, dst)
         except OSError: shutil.copy2(src, dst)
     with wave.open(str(master / 'voice.wav'), 'rb') as src:
-        require(src.getframerate() == 48000 and src.getnchannels() == 2, 'Master voice must be 48kHz stereo PCM')
-        a, b = round(start / fps * 48000), round(end / fps * 48000)
+        rate, channels, width = src.getframerate(), src.getnchannels(), src.getsampwidth()
+        require(width == 2 and src.getcomptype() == 'NONE' and channels in (1, 2),
+                'Master voice must be 16-bit mono or stereo PCM')
+        require(rate % fps == 0, 'Master voice sample rate must divide evenly across the output frame')
+        per = rate // fps
+        a, b = start * per, end * per
         require(b <= src.getnframes(), 'Master narration audio is shorter than its frame clock')
-        src.setpos(a); audio = src.readframes(b-a)
+        src.setpos(a); audio = src.readframes(b - a)
         with wave.open(str(stage / 'voice.wav'), 'wb') as dst:
-            dst.setparams(src.getparams()); dst.writeframes(audio)
+            dst.setnchannels(channels); dst.setsampwidth(width); dst.setframerate(rate)
+            dst.writeframes(audio)
     (stage / 'talkmap.js').write_text('const TALKF=["clip_000"];const TALKMAP=' +
                                    __import__('json').dumps([[0,i+1] for i in range(end-start)], separators=(',',':')) + ';\n')
     report.update(frames=end-start, duration=(end-start)/fps,

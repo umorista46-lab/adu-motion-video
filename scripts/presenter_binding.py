@@ -3,10 +3,16 @@
 
 ``auto-build PLAN TALK OUTPUT`` keeps a single narration master. Without
 ``--presenter-binding``, TALK is the existing audio+video talk and this module
-is not used. With a binding, TALK is 48 kHz stereo PCM and presenter pictures
-are copied only from the named source intervals, one output frame per 1/60 s,
-with no speed change. Every other frame is one shared absence plate, not a
-frame from either presenter source.
+is not used. With a binding, TALK is 16-bit PCM at 24 kHz or 48 kHz, mono or
+stereo. Samples, rate, channel count and order are copied. A shortfall of less
+than one output frame becomes digital silence at the tail. Audible samples are
+not trimmed, resampled or duplicated into another channel. Presenter pictures
+come only from the named source intervals, one output frame per 1/60 s. Every
+other frame is one shared absence plate.
+
+``voice.wav`` and its narration slices stay in that PCM. Separate score files
+are 44.1 kHz stereo, and a later delivery mix/AAC export may resample. Those
+stages are not this master.
 
 This is not a narration edit map. An edit map deletes intervals from one
 audio+video source and shortens the clock. Windows here do not cut the master.
@@ -26,6 +32,7 @@ import wave
 SCHEMA = 'adu-presenter-binding/1'
 FRAME_SIZE = (720, 1280)
 ABSENCE_RGB = (18, 18, 18)
+ACCEPTED_RATES = {24000, 48000}
 GEOMETRY = ('fps=60:start_time=0,'
             'scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos,'
             'pad=720:1280:(ow-iw)/2:(oh-ih)/2')
@@ -143,25 +150,30 @@ def load(binding: Path, narration: Path, frames: int) -> dict:
         fail('Narration master bytes do not match presenter binding narration.sha256')
     try:
         with wave.open(str(narration), 'rb') as audio:
-            if audio.getnchannels() != 2 or audio.getsampwidth() != 2 or audio.getframerate() != 48000:
-                fail('Narration master must already be 48 kHz stereo 16-bit PCM. Binding does not resample or remix it.')
-            if audio.getcomptype() != 'NONE':
-                fail('Narration master must be uncompressed PCM')
+            rate, channels, width = audio.getframerate(), audio.getnchannels(), audio.getsampwidth()
+            if audio.getcomptype() != 'NONE' or width != 2 or channels not in (1, 2) or rate not in ACCEPTED_RATES:
+                fail('Narration master must be 24 kHz or 48 kHz, mono or stereo, 16-bit PCM. '
+                     'Binding does not resample, remix, or change bit depth.')
             samples = audio.getnframes()
+            pcm = audio.readframes(samples)
     except wave.Error as exc:
         fail(f'Narration master is not PCM WAV: {exc}')
-    expected = frames * 800
+    samples_per_frame = rate // 60
+    expected = frames * samples_per_frame
     delta = expected - samples
+    frame_bytes = channels * width
     if delta == 0:
         edge = trimmed = 0
-    elif 0 < delta < 800:
+    elif 0 < delta < samples_per_frame:
         edge, trimmed = delta, 0
-    elif -800 < delta < 0:
+    elif -samples_per_frame < delta < 0:
+        if any(pcm[expected * frame_bytes:]):
+            fail('Refusing to trim audible narration. A long master is kept unless the extra tail is digital silence under one frame.')
         edge, trimmed = 0, -delta
     else:
-        fail(f'Narration master is {samples} samples; the plan needs {expected}. '
-             'Only a sub-frame grid remainder under 800 samples can be padded or trimmed. '
-             'Refusing to stretch, splice, or retime the master.')
+        fail(f'Narration master is {samples} samples at {rate} Hz; the {frames}-frame plan needs {expected}. '
+             'Only a shortfall under one output frame is padded with digital silence. '
+             'Refusing to stretch, splice, resample, or discard audible samples.')
     sources = raw.get('sources')
     windows = raw.get('windows')
     if not isinstance(sources, list) or not sources or not isinstance(windows, list) or not windows:
@@ -217,7 +229,9 @@ def load(binding: Path, narration: Path, frames: int) -> dict:
     if unused:
         fail('Presenter source is not used by any window: ' + ', '.join(unused))
     return dict(narration=narration, narrationIdentity=identity, samples=samples, expectedSamples=expected,
-                edgeQuantizationSamples=edge, trimmedTailSamples=trimmed, sources=prepared, windows=parsed, frames=frames)
+                sampleRate=rate, channels=channels, sampleWidth=width, samplesPerFrame=samples_per_frame,
+                frameBytes=frame_bytes, edgeQuantizationSamples=edge, trimmedTailSamples=trimmed,
+                sources=prepared, windows=parsed, frames=frames)
 
 
 def validate(binding: Path, narration: Path, frames: int) -> dict:
@@ -285,14 +299,14 @@ def install(binding: Path, narration: Path, stage: Path, frames: int) -> dict:
     if len(written) != plan['frames']:
         fail(f'Presenter grid has {len(written)} frames; the plan needs {plan["frames"]}')
     with wave.open(str(plan['narration']), 'rb') as src, wave.open(str(stage / 'voice.wav'), 'wb') as dst:
-        dst.setnchannels(2)
-        dst.setsampwidth(2)
-        dst.setframerate(48000)
+        dst.setnchannels(plan['channels'])
+        dst.setsampwidth(plan['sampleWidth'])
+        dst.setframerate(plan['sampleRate'])
         pcm = src.readframes(plan['samples'])
         if plan['trimmedTailSamples']:
-            pcm = pcm[:plan['expectedSamples'] * 4]
+            pcm = pcm[:plan['expectedSamples'] * plan['frameBytes']]
         elif plan['edgeQuantizationSamples']:
-            pcm += b'\x00' * (4 * plan['edgeQuantizationSamples'])
+            pcm += b'\x00' * (plan['frameBytes'] * plan['edgeQuantizationSamples'])
         dst.writeframes(pcm)
     mapping.write_text('const TALKF=["clip_000"];const TALKMAP=' +
                        json.dumps([[0, i + 1] for i in range(plan['frames'])], separators=(',', ':')) + ';\n',
@@ -303,12 +317,17 @@ def install(binding: Path, narration: Path, stage: Path, frames: int) -> dict:
         frame_width=FRAME_SIZE[0], frame_height=FRAME_SIZE[1],
         presenterBinding=dict(
             schema=SCHEMA,
-            narration=dict(**plan['narrationIdentity'], sampleRate=48000, channels=2, sampleWidthBytes=2,
+            narration=dict(**plan['narrationIdentity'], sampleRate=plan['sampleRate'], channels=plan['channels'],
+                           sampleWidthBytes=plan['sampleWidth'], samplesPerFrame=plan['samplesPerFrame'],
                            samples=plan['samples'], outputSamples=plan['expectedSamples'],
                            edgeQuantizationSamples=plan['edgeQuantizationSamples'],
                            trimmedTailSamples=plan['trimmedTailSamples'],
                            takenFromPresenterSources=False,
-                           policy='PCM samples copied in order. A remainder under one 60fps frame may be digital silence or a trimmed tail; samples are not resampled, spliced, or retimed.'),
+                           policy='PCM samples, rate, channel count and order are copied. A shortfall under one output frame is digital silence at the tail. Audible samples are not trimmed, resampled or remixed.',
+                           stages=dict(
+                               master='voice.wav and narration_slice children keep this PCM',
+                               score='bgm.wav and sfx.wav are separate 44100 stereo generators and do not rewrite voice.wav',
+                               delivery='A later mix or AAC export may loudness-normalize and resample to 48 kHz. That encode is not this PCM master.')),
             sources=[dict(id=item['id'], sha256=item['sha256'], sizeBytes=item['sizeBytes'],
                           durationSeconds=item['duration']) for item in plan['sources']],
             windows=[dict(id=item['id'], sourceId=item['sourceId'], masterStartFrame=item['masterStartFrame'],
