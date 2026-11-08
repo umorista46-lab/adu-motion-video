@@ -54,6 +54,22 @@ def global_scene(item, offset, fps):
     return value
 
 
+def _derived_scope_runs(runs):
+    """Child narration scope is derived from that part's ownership, never stored as an independent edit."""
+    cloned = deepcopy(runs)
+    for run in cloned:
+        spec = run.get('spec') or {}
+        evidence = spec.get('contentEvidence')
+        segments = (spec.get('adaptation') or {}).get('segments') or []
+        if isinstance(evidence, dict):
+            evidence['scopeRefs'] = [ref for segment in segments for ref in segment.get('ownershipRefs', [])]
+    return cloned
+
+
+def _same_saved_runs(recomputed, saved):
+    return _derived_scope_runs(recomputed) == _derived_scope_runs(saved)
+
+
 def build_auto(plan_path, talk, output, subs_js=None, *, edit_map=None, presenter_binding=None):
     require(not output.exists() and not output.is_symlink(), 'Refusing existing auto project')
     require(output.parent.is_dir(), 'Auto project parent must exist')
@@ -69,7 +85,7 @@ def build_auto(plan_path, talk, output, subs_js=None, *, edit_map=None, presente
     require({e['styleId']: e['selection'] for e in pinned} == bindings, 'Pinned style removed; replan explicitly')
     result = choose(saved['brief'], Path(saved['sourceDirectory']), pinned)
     require(result['sourceDigests'] == saved['sourceDigests'], 'Catalog source changed; replan')
-    require(result['spec'] == saved['spec'] and result['runs'] == saved['runs'],
+    require(result['spec'] == saved['spec'] and _same_saved_runs(result['runs'], saved['runs']),
             'Auto choices or run bindings changed; replan instead of editing generated specs')
     require(result['report']['ready'], 'Auto plan still has unbound or blocked episode content')
     runs = result['runs']

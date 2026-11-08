@@ -231,8 +231,13 @@ def child_runs(spec, index, directory):
                        'adaptation': dict(schema='adu-adapted-spec/1', profileId=profile['id'],
                                           profileVersion=profile['version'], profileDigest=profile_digest(profile),
                                           segments=run.pop('segments'), ready=True, validationStage='pre-import')}
-        if run['spec'].get('contentEvidence'):
-            run['spec']['contentEvidence']['scopeRefs'] = [r for s in run['spec']['adaptation']['segments'] for r in s.get('ownershipRefs', [])]
+        evidence = run['spec'].get('contentEvidence')
+        if evidence:
+            # globals_ is one deepcopy shared by every run. A later part must not
+            # overwrite an earlier part's narration scope.
+            evidence = deepcopy(evidence)
+            evidence['scopeRefs'] = [r for s in run['spec']['adaptation']['segments'] for r in s.get('ownershipRefs', [])]
+            run['spec']['contentEvidence'] = evidence
     return runs
 
 
